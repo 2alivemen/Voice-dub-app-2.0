@@ -11,7 +11,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // Helper for exponential backoff retry on rate limits and transient network errors
-async function retryWithBackoff<T>(fn: () => Promise<T>, maxRetries = 3, initialDelay = 1500): Promise<T> {
+async function retryWithBackoff<T>(fn: () => Promise<T>, maxRetries = 5, initialDelay = 1500): Promise<T> {
   let attempt = 0;
   while (true) {
     try {
@@ -58,17 +58,17 @@ async function retryWithBackoff<T>(fn: () => Promise<T>, maxRetries = 3, initial
       if (retryInfo?.retryDelay) {
         const secMatch = String(retryInfo.retryDelay).match(/([\d.]+)s?/);
         if (secMatch) {
-          delayMs = Math.ceil(parseFloat(secMatch[1]) * 1000) + 750;
+          delayMs = Math.ceil(parseFloat(secMatch[1]) * 1000) + 1000;
         }
       } else {
         const msgMatch = err?.message?.match(/Please retry in ([\d.]+)s/i);
         if (msgMatch) {
-          delayMs = Math.ceil(parseFloat(msgMatch[1]) * 1000) + 750;
+          delayMs = Math.ceil(parseFloat(msgMatch[1]) * 1000) + 1000;
         }
       }
 
-      // Cap delay to 32 seconds max
-      if (delayMs > 32000) {
+      // Cap delay to 45 seconds max
+      if (delayMs > 45000) {
         throw err;
       }
 

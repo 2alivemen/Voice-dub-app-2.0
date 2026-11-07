@@ -4,8 +4,8 @@ import {
   stitchAudioBuffers,
   audioBufferToWavBlob,
   blobToBase64,
-  splitAudioBufferIntoSegments,
 } from '../utils/audioUtils';
+import { sanitizeDialogueTextForTTS } from '../utils/screenplayParser';
 
 export interface TTSApiResponse {
   audioBase64: string;
@@ -70,6 +70,7 @@ export async function auditionVoicePersona(
 /**
  * Synthesizes an individual dialogue turn.
  * Provides a dedicated audio take for this turn so the user can play or download it individually.
+ * Sanitizes pause directives ([pause: 50ms], etc.) to natural prosodic breath markers.
  */
 export async function synthesizeSingleTurn(
   turn: DialogueTurn,
@@ -87,11 +88,13 @@ export async function synthesizeSingleTurn(
     },
   };
 
+  const cleanText = sanitizeDialogueTextForTTS(turn.text);
+
   const payload = [
     {
       id: turn.id,
       speaker,
-      text: turn.text.trim(),
+      text: cleanText,
       emotion: turn.emotion.trim(),
       vocalizeSpeakerName: turn.vocalizeSpeakerName ?? false,
     },
@@ -107,11 +110,13 @@ export async function synthesizeSingleTurn(
 }
 
 /**
- * Synthesizes an entire scene using Intelligent Character Batching:
- * - Collects all lines for each character and synthesizes them in 1 API call per character.
- * - This dramatically reduces API hits from N turns to just K characters (e.g., 10 turns -> 2-3 calls).
- * - Slices the batched audio into individual dialogue turn takes so each line remains independently playable/re-recordable.
- * - Reorganizes and stitches all turns into the exact chronological screenplay sequence.
+ * Synthesizes an entire scene in exact chronological screenplay order:
+ * - Iterates strictly through dialogue turns in script sequence (Turn 1, Turn 2, Turn 3...).
+ * - Caches and reuses already-voiced turns so repeated attempts or retakes don't waste API quota.
+ * - Paces requests (1.2s delay) to stay comfortably within rate limits, while the backend's
+ *   exponential backoff handles any transient rate limits seamlessly.
+ * - Sanitizes all pause directives ([pause: 50ms], (pause 50ms), etc.) to natural speech pauses (...).
+ * - Stitches all individual turn audio takes into a master soundtrack in 100% script sequence.
  */
 export async function synthesizeFullScene(
   scene: Scene,
@@ -131,103 +136,54 @@ export async function synthesizeFullScene(
     };
   }
 
-  // 1. Group dialogue turns by character
-  const turnsBySpeaker: Record<string, DialogueTurn[]> = {};
-  for (const turn of scene.dialogueTurns) {
-    const spk = turn.speaker.trim();
-    if (!turnsBySpeaker[spk]) {
-      turnsBySpeaker[spk] = [];
-    }
-    turnsBySpeaker[spk].push(turn);
-  }
-
-  const uniqueSpeakerNames = Object.keys(turnsBySpeaker);
-  const totalCharacters = uniqueSpeakerNames.length;
+  const totalTurns = scene.dialogueTurns.length;
   const turnAudios: Record<string, { audioBase64: string; duration: number }> = {};
-  const turnBuffersById: Record<string, AudioBuffer> = {};
+  const orderedTurnBuffers: AudioBuffer[] = [];
 
-  // 2. Synthesize all dialogue for each character in 1 collective call per character
-  for (let cIdx = 0; cIdx < totalCharacters; cIdx++) {
-    const speaker = uniqueSpeakerNames[cIdx];
-    const characterTurns = turnsBySpeaker[speaker];
-    const cv = characterVoices.find((c) => c.name.trim().toLowerCase() === speaker.toLowerCase());
-    const voiceName = cv ? cv.voiceName : 'Fenrir';
-    const basePersonality = cv ? cv.basePersonality : 'Historical dramatic performance';
+  // Synthesize each turn in guaranteed chronological sequence
+  for (let i = 0; i < totalTurns; i++) {
+    const turn = scene.dialogueTurns[i];
+    const speaker = turn.speaker.trim();
 
     onProgress?.(
-      `Voicing Character ${cIdx + 1}/${totalCharacters}: ${speaker} (${characterTurns.length} line${
-        characterTurns.length > 1 ? 's' : ''
-      })...`,
-      cIdx,
-      totalCharacters
+      `Voicing Line ${i + 1}/${totalTurns} (${speaker})...`,
+      i,
+      totalTurns
     );
 
-    if (cIdx > 0) {
-      // Pacing pause between character calls to keep RPM well within quota
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-    }
-
-    if (characterTurns.length === 1) {
-      // Single line for this character: synthesize directly
-      const singleResult = await synthesizeSingleTurn(characterTurns[0], characterVoices);
-      const buf = await decodeAudioBase64(singleResult.audioBase64);
-      turnAudios[characterTurns[0].id] = singleResult;
-      turnBuffersById[characterTurns[0].id] = buf;
-    } else {
-      // Multiple lines for this character: batch all lines into 1 single API call with pause separators
-      const batchedPayload = characterTurns.map((t, idx) => {
-        let lineText = t.text.trim();
-        // Insert pause marker between lines so audio segments can be cleanly partitioned
-        if (idx < characterTurns.length - 1 && !lineText.endsWith('[pause: 1.2s]')) {
-          lineText = `${lineText} [pause: 1.2s]`;
-        }
-        return {
-          id: t.id,
-          speaker,
-          text: lineText,
-          emotion: t.emotion.trim(),
-          vocalizeSpeakerName: t.vocalizeSpeakerName ?? false,
-        };
-      });
-
-      const voiceMap = {
-        [speaker]: {
-          voiceName,
-          basePersonality,
-        },
-      };
-
-      const result = await callBackendSynthesize(batchedPayload, voiceMap);
-      const combinedBuffer = await decodeAudioBase64(result.audioBase64);
-
-      // Split the collective buffer into individual audio takes for each turn
-      const segments = splitAudioBufferIntoSegments(combinedBuffer, characterTurns.length, 0.4);
-
-      for (let s = 0; s < characterTurns.length; s++) {
-        const turn = characterTurns[s];
-        const segBuf = segments[s];
-        const wavBlob = audioBufferToWavBlob(segBuf);
-        const segBase64 = await blobToBase64(wavBlob);
-
+    // If turn was already recorded and has valid audio, reuse it to save API calls
+    if (turn.audioBase64 && turn.duration && turn.duration > 0) {
+      try {
+        const cachedBuffer = await decodeAudioBase64(turn.audioBase64);
         turnAudios[turn.id] = {
-          audioBase64: segBase64,
-          duration: segBuf.duration,
+          audioBase64: turn.audioBase64,
+          duration: turn.duration,
         };
-        turnBuffersById[turn.id] = segBuf;
+        orderedTurnBuffers.push(cachedBuffer);
+        continue;
+      } catch {
+        // If decoding cached audio fails, regenerate this turn below
       }
     }
-  }
 
-  // 3. Reorganize and stitch all turn buffers in the EXACT original screenplay sequence!
-  onProgress?.(`Reorganizing & Mastering Scene ${scene.sceneNumber} in script order...`, totalCharacters, totalCharacters);
-
-  const orderedTurnBuffers: AudioBuffer[] = [];
-  for (const turn of scene.dialogueTurns) {
-    const buf = turnBuffersById[turn.id];
-    if (buf) {
-      orderedTurnBuffers.push(buf);
+    // Pacing pause between API calls to stay within free-tier RPM limits
+    if (i > 0) {
+      await new Promise((resolve) => setTimeout(resolve, 1200));
     }
+
+    // Synthesize turn take
+    const singleResult = await synthesizeSingleTurn(turn, characterVoices);
+    const buf = await decodeAudioBase64(singleResult.audioBase64);
+
+    turnAudios[turn.id] = {
+      audioBase64: singleResult.audioBase64,
+      duration: buf.duration,
+    };
+    orderedTurnBuffers.push(buf);
   }
+
+  // Master all turn buffers in the EXACT original screenplay sequence!
+  onProgress?.(`Mastering Scene ${scene.sceneNumber} in script order...`, totalTurns, totalTurns);
 
   const stitchedBuffer = stitchAudioBuffers(orderedTurnBuffers, 0.25);
   const wavBlob = audioBufferToWavBlob(stitchedBuffer);

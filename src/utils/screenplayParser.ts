@@ -172,6 +172,46 @@ Style: Haughty, veiled menace.
   },
 ];
 
+/**
+ * Sanitizes dialogue text for Gemini TTS generation:
+ * - Translates bracketed and parenthesized pause directives ([pause: 50ms], (pause 50ms), etc.) into natural prosodic ellipses (...)
+ * - Converts [beat], (beat), [silence] to natural pause ellipses
+ * - Strips outer surrounding quotes ("...", “...”)
+ * - Cleans up inner adjacent quotation marks (e.g. 'Line 1" "Line 2' -> 'Line 1 Line 2')
+ * - Ensures natural, expressive breathing pauses without speaking the word "pause" aloud
+ */
+export function sanitizeDialogueTextForTTS(rawText: string): string {
+  if (!rawText) return '';
+  let text = rawText;
+
+  // 1. Replace bracketed or parenthesized pause directives with ellipsis for natural prosodic breath
+  // Examples: [pause: 50ms], [pause 50 ms], (pause: 50ms), (pause 500ms), [pause 1.2s], [pause], (pause)
+  text = text.replace(/\[\s*pause(?::|\s)+[\d.]+\s*(?:ms|s|sec|seconds)?\s*\]/gi, '... ');
+  text = text.replace(/\(\s*pause(?::|\s)+[\d.]+\s*(?:ms|s|sec|seconds)?\s*\)/gi, '... ');
+  text = text.replace(/\[\s*pause\s*\]/gi, '... ');
+  text = text.replace(/\(\s*pause\s*\)/gi, '... ');
+
+  // 2. Bare pause notations like "pause 50 ms", "pause 100ms", "(beat)", "[beat]", "(silence)", "[silence]"
+  text = text.replace(/\bpause\s+[\d.]+\s*(?:ms|s|sec|seconds)?\b/gi, '... ');
+  text = text.replace(/\[\s*(?:beat|silence|gap)\s*\]/gi, '... ');
+  text = text.replace(/\(\s*(?:beat|silence|gap)\s*\)/gi, '... ');
+
+  // 3. SSML break tags if present: <break time="..."/>
+  text = text.replace(/<break[^>]*\/?>/gi, '... ');
+
+  // 4. Strip surrounding quotation marks ("...", “...”, '...')
+  text = text.replace(/^["“'‘]+|["”'’]+$/g, '').trim();
+
+  // 5. Clean redundant internal quote pairings like 'Line 1" "Line 2' into seamless text
+  text = text.replace(/["”]\s*["“]/g, ' ');
+
+  // 6. Clean multiple consecutive ellipses or spaces
+  text = text.replace(/(?:\s*\.\.\.){2,}/g, '... ');
+  text = text.replace(/\s{2,}/g, ' ');
+
+  return text.trim();
+}
+
 // Parser function supporting Voice/Gender, Style, (IA) flags, and quoted dialogue
 export function parseScreenplayText(text: string): {
   screenplay: Screenplay;
@@ -214,9 +254,7 @@ export function parseScreenplayText(text: string): {
   const commitTurn = () => {
     if (currentSpeaker && currentDialogueLines.length > 0) {
       let spokenText = currentDialogueLines.join(' ').trim();
-      // Strip surrounding quotes: "The news..." -> The news...
-      spokenText = spokenText.replace(/^["“](.*)["”]$/, '$1').trim();
-      spokenText = spokenText.replace(/^"|"$/g, '').trim();
+      spokenText = sanitizeDialogueTextForTTS(spokenText);
 
       if (spokenText) {
         if (!currentScene) {
@@ -270,6 +308,15 @@ export function parseScreenplayText(text: string): {
     const line = rawLine.trim();
 
     if (!line) {
+      if (inContextBlock) {
+        commitContext();
+        inContextBlock = false;
+      }
+      continue;
+    }
+
+    // 0. Ignore Markdown horizontal dividers / section breaks (---, ===, ***, ___):
+    if (/^[-=*_~]{3,}$/.test(line)) {
       if (inContextBlock) {
         commitContext();
         inContextBlock = false;
@@ -372,6 +419,52 @@ export function parseScreenplayText(text: string): {
       } else {
         currentStyle = rawStyle;
       }
+      continue;
+    }
+
+    // 5b. Detect Speaker with inline Style: e.g. "KING Style: bold military urgency", "VOICE 3 — SOMESHVARA Style: Orus..."
+    const inlineSpeakerWithStyle = line.match(/^((?:(?:VOICE|CHARACTER|SPEAKER)\s*\d*\s*[-—–:]\s*)?[A-Za-z0-9\s._'()/,–—-]{2,40}?)\s*(?:[-—–]|\s)\s*Style\s*[:=]\s*(.+)$/i);
+    if (inlineSpeakerWithStyle) {
+      commitTurn();
+      commitContext();
+      inContextBlock = false;
+
+      let extractedSpeakerRaw = inlineSpeakerWithStyle[1].trim();
+      let rawStyle = inlineSpeakerWithStyle[2].trim();
+
+      let isInactiveAnnouncement = /\b(?:IA|NO_NAME|SILENT|DIRECT|MUTED?_NAME)\b/i.test(extractedSpeakerRaw);
+      let isExplicitSayName = /\b(?:SAY_NAME|ANNOUNCE|VOCALIZE|NAME)\b/i.test(extractedSpeakerRaw);
+
+      let cleanSpeaker = extractedSpeakerRaw
+        .replace(/\([^)]*\)|\[[^\]]*\]/g, '')
+        .replace(/^(?:VOICE|SPEAKER|CHARACTER)\s*\d*\s*[-—–:]\s*/i, '')
+        .trim()
+        .toUpperCase();
+
+      currentSpeaker = cleanSpeaker;
+
+      const hasVoiceInSpeaker = /(?:female|woman|queen|kore|aoede|leda|male|baritone|bass|grave|tenor|puck|charon|fenrir|zephyr|orus)/i.test(extractedSpeakerRaw);
+      const hasVoiceInStyle = /(?:female|woman|queen|soprano|kore|aoede|leda|male|baritone|bass|grave|tenor|youth|puck|charon|fenrir|zephyr|orus)/i.test(rawStyle);
+
+      if (hasVoiceInSpeaker && !characterExplicitVoices[cleanSpeaker]) {
+        const detectedVoice = parseVoiceDescriptor(extractedSpeakerRaw);
+        characterExplicitVoices[cleanSpeaker] = detectedVoice;
+        characterVoiceSources[cleanSpeaker] = `In Speaker Tag (${detectedVoice})`;
+      } else if (hasVoiceInStyle && !characterExplicitVoices[cleanSpeaker]) {
+        const detectedVoice = parseVoiceDescriptor(rawStyle);
+        characterExplicitVoices[cleanSpeaker] = detectedVoice;
+        characterVoiceSources[cleanSpeaker] = `From Style (${detectedVoice})`;
+      }
+
+      currentStyle = rawStyle;
+
+      const isNarrator = cleanSpeaker === 'NARRATOR' || cleanSpeaker === 'CHRONICLER';
+      if (isNarrator) {
+        currentVocalizeName = isExplicitSayName ? true : false;
+      } else {
+        currentVocalizeName = isInactiveAnnouncement ? false : true;
+      }
+
       continue;
     }
 
@@ -483,7 +576,9 @@ export function parseScreenplayText(text: string): {
     const namePartClean = line.replace(/\([^)]*\)|\[[^\]]*\]/g, '').trim();
     const isParentheticalOnly = /^\([^)]+\)$/.test(line);
 
+    const hasLetters = /[a-zA-Z\p{L}]/u.test(namePartClean);
     const isUppercaseSpeakerHeading =
+      hasLetters &&
       !isParentheticalOnly &&
       !nonSpeakerWords.test(namePartClean) &&
       /^[A-Z0-9\s'/-]{2,35}$/.test(namePartClean) &&

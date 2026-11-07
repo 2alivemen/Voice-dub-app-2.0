@@ -555,15 +555,15 @@ export default function App() {
               </div>
 
               {/* In-Script Formatting Guide Strip */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 p-2.5 rounded-lg bg-[#0a0c13] border border-[#1d2334] text-[11px]">
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5 p-2.5 rounded-lg bg-[#0a0c13] border border-[#1d2334] text-[11px]">
                 <div className="flex items-start gap-1.5 text-slate-300">
                   <span className="text-amber-400 font-bold shrink-0">1.</span>
                   <div>
-                    <strong className="text-amber-200">Character Name Vocalization:</strong>
+                    <strong className="text-amber-200">Name Vocalization (IA):</strong>
                     <div className="text-[10px] text-slate-400 mt-0.5">
-                      <code className="text-amber-300">VIKRAMADITYA:</code> announces name aloud.
+                      <code className="text-sky-300">KING (IA):</code> speaks direct dialogue without announcing name.
                       <br />
-                      <code className="text-sky-300">VIKRAMADITYA(IA):</code> speaks direct dialogue (IA = Inactive Announcement).
+                      <code className="text-amber-300">KING:</code> announces name aloud first.
                     </div>
                   </div>
                 </div>
@@ -571,9 +571,11 @@ export default function App() {
                 <div className="flex items-start gap-1.5 text-slate-300">
                   <span className="text-amber-400 font-bold shrink-0">2.</span>
                   <div>
-                    <strong className="text-amber-200">In-Script Voice & Gender:</strong>
+                    <strong className="text-amber-200">Style &amp; Delivery Syntax:</strong>
                     <div className="text-[10px] text-slate-400 mt-0.5">
-                      Write <code className="text-amber-300">Voice: Kore</code>, <code className="text-amber-300">Voice: Aoede</code>, <code className="text-amber-300">Voice: Orus</code>, <code className="text-amber-300">Voice: Fenrir</code>, or in <code className="text-amber-300">Style: Aoede, melodic cadence...</code> (Supports all 8 Gemini studio voices)
+                      Separate line: <code className="text-amber-300">Style: Somber authority</code>
+                      <br />
+                      Or inline: <code className="text-amber-300">KING Style: Bold urgency</code>
                     </div>
                   </div>
                 </div>
@@ -581,9 +583,19 @@ export default function App() {
                 <div className="flex items-start gap-1.5 text-slate-300">
                   <span className="text-amber-400 font-bold shrink-0">3.</span>
                   <div>
-                    <strong className="text-amber-200">Individual Line Takes:</strong>
+                    <strong className="text-amber-200">Quotes &amp; Pauses:</strong>
                     <div className="text-[10px] text-slate-400 mt-0.5">
-                      Each dialogue turn card has its own dedicated <strong>Play Take</strong> and <strong>Download WAV</strong> button to fine-tune individual lines.
+                      Quotes <code className="text-amber-300">"..."</code> are optional! For natural pauses, write <code className="text-amber-300">...</code> or <code className="text-amber-300">[pause: 50ms]</code> / <code className="text-amber-300">(beat)</code>.
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex items-start gap-1.5 text-slate-300">
+                  <span className="text-amber-400 font-bold shrink-0">4.</span>
+                  <div>
+                    <strong className="text-amber-200">Voice Casting:</strong>
+                    <div className="text-[10px] text-slate-400 mt-0.5">
+                      Supports all 8 Gemini voices: <code className="text-amber-300">Fenrir</code>, <code className="text-amber-300">Kore</code>, <code className="text-amber-300">Aoede</code>, <code className="text-amber-300">Orus</code>, <code className="text-amber-300">Charon</code>, <code className="text-amber-300">Puck</code>, <code className="text-amber-300">Zephyr</code>, <code className="text-amber-300">Leda</code> via <code className="text-amber-300">Voice: Orus</code>.
                     </div>
                   </div>
                 </div>

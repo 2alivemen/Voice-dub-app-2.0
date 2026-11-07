@@ -167,20 +167,32 @@ export const ScreenplayEditorModal: React.FC<ScreenplayEditorModalProps> = ({
               placeholder={`Paste any historical screenplay or narrative text:\n\nSCENE 1: INT. ROMAN SENATE - NIGHT\nCandles flicker in the great rotunda.\n\nCAESAR (with solemn authority):\nAre we all ready?\n\nBRUTUS (whispering):\nMost high, most mighty Caesar.`}
             />
 
-            {/* Parsing notice */}
-            <div className="p-3 rounded-lg bg-[#131724] border border-[#20273a] flex flex-col gap-1.5 text-[11px] text-slate-400 leading-normal">
-              <div className="flex items-center gap-1.5 text-amber-300 font-semibold">
-                <BookOpen className="w-3.5 h-3.5" />
-                <span>Screenplay Direction &amp; Voice Guide:</span>
+            {/* Comprehensive Parsing & Screenplay Guide */}
+            <div className="p-3.5 rounded-lg bg-[#131724] border border-[#20273a] flex flex-col gap-2 text-[11px] text-slate-400 leading-normal">
+              <div className="flex items-center gap-1.5 text-amber-300 font-semibold text-xs">
+                <BookOpen className="w-4 h-4" />
+                <span>Screenplay Direction, Voice &amp; Syntax Guide:</span>
               </div>
-              <p>
-                • <strong>Voice Casting:</strong> Explicitly specify any of the 8 Gemini studio voices: <code className="text-amber-200 font-mono">Fenrir</code>, <code className="text-amber-200 font-mono">Charon</code>, <code className="text-amber-200 font-mono">Kore</code>, <code className="text-amber-200 font-mono">Aoede</code>, <code className="text-amber-200 font-mono">Orus</code>, <code className="text-amber-200 font-mono">Puck</code>, <code className="text-amber-200 font-mono">Zephyr</code>, or <code className="text-amber-200 font-mono">Leda</code> via <code className="text-amber-200 font-mono">Voice: Aoede</code> or in <code className="text-amber-200 font-mono">Style: Female voice (Aoede), melodic cadence</code>.
-              </p>
-              <p>
-                • <strong>Name Vocalization:</strong> Standard format <code className="text-amber-200 font-mono">VIKRAMADITYA: "..."</code> announces the character name aloud before speech. Add <code className="text-sky-300 font-mono">(IA)</code> (e.g. <code className="text-sky-300 font-mono">VIKRAMADITYA(IA): "..."</code>) for Inactive Announcement—the voice switches directly without yelling the character name!
-              </p>
-              <p>
-                • <strong>Atmosphere / Stage directions:</strong> Context blocks like <code className="text-amber-200 font-mono">CONTEXT:</code> or <code className="text-amber-200 font-mono">STAGE DIRECTION:</code> are kept for historical context and strictly never read aloud.
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5 pt-1">
+                <div className="flex flex-col gap-1">
+                  <p>
+                    • <strong>Name Vocalization:</strong> Write <code className="text-amber-200 font-mono">KING: "..."</code> to announce name aloud. Write <code className="text-sky-300 font-mono">KING (IA): "..."</code> or <code className="text-sky-300 font-mono">VOICE 1 — KING (IA):</code> for <strong>Inactive Announcement</strong>—the voice switches directly without speaking the character name! (Narrator is direct by default).
+                  </p>
+                  <p>
+                    • <strong>Style &amp; Delivery Syntax:</strong> Both separate lines (<code className="text-amber-200 font-mono">Style: Calm authority</code>) and inline (<code className="text-amber-200 font-mono">KING Style: Calm authority</code> or <code className="text-amber-200 font-mono">KING (IA, Style: Bold):</code>) are fully supported.
+                  </p>
+                </div>
+                <div className="flex flex-col gap-1">
+                  <p>
+                    • <strong>Quotes Optional:</strong> Dialogues work identically whether enclosed in quotation marks <code className="text-amber-200 font-mono">"..."</code> or written unquoted. Stray quotes are cleaned automatically.
+                  </p>
+                  <p>
+                    • <strong>Natural Pauses &amp; Beats:</strong> Use an ellipsis <code className="text-amber-200 font-mono">... </code> or tags like <code className="text-amber-200 font-mono">[pause: 50ms]</code>, <code className="text-amber-200 font-mono">(pause 50ms)</code>, or <code className="text-amber-200 font-mono">(beat)</code>. The engine translates them into natural acoustic breath pauses without speaking the word "pause" aloud!
+                  </p>
+                </div>
+              </div>
+              <p className="text-[10px] text-slate-500 pt-1 border-t border-[#1e2536]">
+                • <strong>8 Prebuilt Studio Voices:</strong> <code className="text-amber-300 font-mono">Fenrir</code> (Deep Baritone/Emperor), <code className="text-amber-300 font-mono">Charon</code> (Grave Bass/Elder), <code className="text-amber-300 font-mono">Kore</code> (Female Mezzo-Soprano/Queen), <code className="text-amber-300 font-mono">Aoede</code> (Melodic Female/Princess), <code className="text-amber-300 font-mono">Orus</code> (Bold Military Urgency/General), <code className="text-amber-300 font-mono">Puck</code> (Agile Tenor/Youth), <code className="text-amber-300 font-mono">Zephyr</code> (Warm Audiobook Narration/Sage), <code className="text-amber-300 font-mono">Leda</code> (Gentle Female/Confidante).
               </p>
             </div>
           </div>
