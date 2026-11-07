@@ -1,0 +1,6 @@
+{
+  "summary": "Implementation plan for Historical Film Voice Studio, detailing screenplay parsing, character voice casting, Gemini TTS multi-speaker orchestration, per-line retakes, waveform players, and ZIP/master audio exports.",
+  "updatedAt": "2026-10-18T12:14:49.262323887Z",
+  "requestFeedback": true,
+  "userFacing": true
+}

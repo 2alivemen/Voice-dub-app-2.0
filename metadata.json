@@ -1,0 +1,6 @@
+{
+  "name": "Historical Film Voice Studio",
+  "description": "Professional narration and multi-speaker dialogue production workstation for animated historical films, powered by official Gemini TTS.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
