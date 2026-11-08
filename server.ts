@@ -1,4 +1,5 @@
-import express, { Request, Response } from 'express';
+import express from 'express';
+import type { Request, Response } from 'express';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -82,19 +83,90 @@ async function retryWithBackoff<T>(fn: () => Promise<T>, maxRetries = 5, initial
   }
 }
 
-// Resilient TTS generation: uses gemini-3.8-flash-tts, gemini-2.5-flash, and fallback
+// Helper to format clean, accurate rate limit and quota error messages
+function formatQuotaErrorMessage(err: any): string {
+  const isDailyLimit =
+    err?.message?.includes('GenerateRequestsPerDay') ||
+    err?.message?.includes('requests per day limit exceeded') ||
+    err?.message?.includes('PerDayPerProject');
+
+  // Parse exact retry delay if provided by Google API
+  let retryTimeStr = '';
+  const detailsList = err?.errorDetails || err?.details || [];
+  const retryInfo = Array.isArray(detailsList)
+    ? detailsList.find((d: any) => d?.retryDelay || d?.['@type']?.includes('RetryInfo'))
+    : null;
+
+  if (retryInfo?.retryDelay) {
+    const sec = parseFloat(String(retryInfo.retryDelay).replace('s', ''));
+    if (!isNaN(sec)) {
+      if (sec >= 3600) {
+        const h = Math.floor(sec / 3600);
+        const m = Math.floor((sec % 3600) / 60);
+        retryTimeStr = `${h}h ${m}m`;
+      } else if (sec >= 60) {
+        retryTimeStr = `${Math.ceil(sec / 60)} minutes`;
+      } else {
+        retryTimeStr = `${Math.ceil(sec)} seconds`;
+      }
+    }
+  }
+
+  if (!retryTimeStr) {
+    const rawMatch = err?.message?.match(/Please retry in ([\d.]+)([a-z]+)?/i);
+    if (rawMatch) {
+      const num = parseFloat(rawMatch[1]);
+      const unit = rawMatch[2] || 's';
+      if (!isNaN(num)) {
+        if (num >= 3600 || unit === 'h') {
+          const totalSec = unit === 'h' ? num * 3600 : num;
+          const h = Math.floor(totalSec / 3600);
+          const m = Math.floor((totalSec % 3600) / 60);
+          retryTimeStr = `${h}h ${m}m`;
+        } else if (num >= 60 || unit === 'm') {
+          const totalSec = unit === 'm' ? num * 60 : num;
+          retryTimeStr = `${Math.ceil(totalSec / 60)} minutes`;
+        } else {
+          retryTimeStr = `${Math.ceil(num)} seconds`;
+        }
+      } else {
+        retryTimeStr = rawMatch[1].replace(/\.\d+s?$/, 's');
+      }
+    }
+  }
+
+  if (isDailyLimit) {
+    const retryNote = retryTimeStr ? ` Resets in ~${retryTimeStr} (at midnight UTC).` : ' Quota resets daily at midnight UTC.';
+    return `Gemini Free Tier daily quota limit reached (10 requests/day per project).${retryNote} Upgrade to a paid plan or provide a custom Gemini API key with billing enabled to continue.`;
+  }
+
+  const isRateLimit =
+    err?.status === 429 ||
+    err?.message?.includes('429') ||
+    err?.message?.includes('RESOURCE_EXHAUSTED') ||
+    err?.message?.includes('quota');
+
+  if (isRateLimit) {
+    const secNote = retryTimeStr || '20s';
+    return `Gemini Free Tier short-term rate limit reached. Please wait ${secNote} before generating audio again.`;
+  }
+
+  return err?.message || 'Gemini TTS synthesis encountered an unexpected error.';
+}
+
+// Resilient TTS generation: uses gemini-3.8-flash-tts, gemini-3.8-flash-lite-tts, and gemini-2.5-flash-preview-tts
 async function generateTTSAudioWithFallback(
   ai: GoogleGenAI,
   contents: any,
   speechConfig: any,
   preferredModel = 'gemini-3.8-flash-tts'
 ): Promise<{ base64Audio: string; modelUsed: string }> {
-  // Prioritize gemini-3.8-flash-tts (full audio model with higher quota) over lite-tts (which only has 10 req/day)
+  // Use valid active TTS models only (gemini-2.5-flash is retired/404)
   const candidateModels = [
     preferredModel,
     'gemini-3.8-flash-tts',
-    'gemini-2.5-flash',
     'gemini-3.8-flash-lite-tts',
+    'gemini-2.5-flash-preview-tts',
   ];
   const modelsToTry = candidateModels.filter((v, i, a) => a.indexOf(v) === i);
 
@@ -102,13 +174,44 @@ async function generateTTSAudioWithFallback(
 
   for (const model of modelsToTry) {
     try {
+      let callContents = contents;
+      let callSpeechConfig = speechConfig;
+
+      // gemini-2.5-flash-preview-tts requires clear TTS instructions and doesn't accept multiSpeakerVoiceConfig
+      if (model.includes('preview-tts')) {
+        // Strip speechMetadata if present and ensure prompt tells model to read aloud
+        if (Array.isArray(contents)) {
+          callContents = contents.map((c: any) => {
+            if (c.parts && Array.isArray(c.parts)) {
+              return {
+                ...c,
+                parts: c.parts.map((p: any) => {
+                  const rawText = p.text || '';
+                  const prefix = rawText.startsWith('Please read') ? '' : 'Please read aloud with dramatic clarity: ';
+                  return { text: `${prefix}${rawText}` };
+                }),
+              };
+            }
+            return c;
+          });
+        }
+
+        // If multiSpeakerVoiceConfig was passed, preview-tts only supports single voiceConfig
+        if (speechConfig?.multiSpeakerVoiceConfig) {
+          const firstSpeaker = speechConfig.multiSpeakerVoiceConfig.speakerVoiceConfigs?.[0];
+          callSpeechConfig = {
+            voiceConfig: firstSpeaker?.voiceConfig || { prebuiltVoiceConfig: { voiceName: 'Puck' } },
+          };
+        }
+      }
+
       const response = await retryWithBackoff(() =>
         ai.models.generateContent({
           model,
-          contents,
+          contents: callContents,
           config: {
             responseModalities: ['AUDIO'],
-            speechConfig,
+            speechConfig: callSpeechConfig,
           },
         })
       );
@@ -128,7 +231,10 @@ async function generateTTSAudioWithFallback(
 
 async function startServer() {
   const app = express();
-  const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
+  const portArgIndex = process.argv.indexOf('--port');
+  const portArg = portArgIndex !== -1 ? parseInt(process.argv[portArgIndex + 1], 10) : NaN;
+  // Dev server must always bind to port 3000 (port 8080 is occupied by nginx reverse proxy)
+  const PORT = !isNaN(portArg) ? portArg : 3000;
 
   app.use(express.json({ limit: '50mb' }));
 
@@ -224,24 +330,7 @@ async function startServer() {
       });
     } catch (err: any) {
       console.error('[Audition Error]', err);
-      const isDailyLimit =
-        err?.message?.includes('GenerateRequestsPerDay') ||
-        err?.message?.includes('requests per day limit exceeded');
-      const isRateLimit =
-        err?.status === 429 ||
-        err?.message?.includes('429') ||
-        err?.message?.includes('RESOURCE_EXHAUSTED') ||
-        err?.message?.includes('quota');
-
-      let errorMessage = err.message || 'Failed to synthesize audition take.';
-      if (isDailyLimit) {
-        errorMessage = 'Gemini API Daily Free Tier Quota Limit reached (50 requests/day).';
-      } else if (isRateLimit) {
-        const msgMatch = err?.message?.match(/Please retry in ([\d.]+)s/i);
-        const sec = msgMatch ? Math.ceil(parseFloat(msgMatch[1])) : 20;
-        errorMessage = `Gemini Free Tier rate limit reached (3 requests/min). Please wait ${sec}s before auditioning again.`;
-      }
-
+      const errorMessage = formatQuotaErrorMessage(err);
       res.status(err?.status || 500).json({
         error: errorMessage,
         status: err?.status,
@@ -404,21 +493,15 @@ async function startServer() {
       console.error('[Synthesize Error]', err);
       const isDailyLimit =
         err?.message?.includes('GenerateRequestsPerDay') ||
-        err?.message?.includes('requests per day limit exceeded');
+        err?.message?.includes('requests per day limit exceeded') ||
+        err?.message?.includes('PerDayPerProject');
       const isRateLimit =
         err?.status === 429 ||
         err?.message?.includes('429') ||
         err?.message?.includes('RESOURCE_EXHAUSTED') ||
         err?.message?.includes('quota');
 
-      let errorMessage = err.message || 'Gemini TTS synthesis failed.';
-      if (isDailyLimit) {
-        errorMessage = 'Gemini API Daily Free Tier Quota Limit reached (50 requests/day).';
-      } else if (isRateLimit) {
-        const msgMatch = err?.message?.match(/Please retry in ([\d.]+)s/i);
-        const sec = msgMatch ? Math.ceil(parseFloat(msgMatch[1])) : 20;
-        errorMessage = `Gemini Free Tier rate limit reached (3 requests/min). Please wait ${sec}s before generating the next line.`;
-      }
+      const errorMessage = formatQuotaErrorMessage(err);
 
       res.status(err?.status || 500).json({
         error: errorMessage,

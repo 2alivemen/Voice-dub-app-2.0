@@ -12,9 +12,9 @@ import { ExportModal } from './components/ExportModal';
 import { AudioTimelinePlayer } from './components/AudioTimelinePlayer';
 import { HISTORICAL_TEMPLATES, parseScreenplayText } from './utils/screenplayParser';
 import { CharacterVoice, DialogueTurn, GeminiPrebuiltVoice, Scene, Screenplay } from './types/screenplay';
-import { synthesizeFullScene, synthesizeSingleTurn } from './services/ttsService';
-import { stitchAudioBuffers, audioBufferToWavBlob, blobToBase64, decodeAudioBase64 } from './utils/audioUtils';
-import { Film, Mic, Sparkles, Sliders, AlertCircle, RefreshCw, CheckCircle2, ChevronDown, ChevronUp, FileText, Check } from 'lucide-react';
+import { synthesizeFullScene, synthesizeSingleTurn, SynthesisMode } from './services/ttsService';
+import { stitchAudioBuffers, audioBufferToWavBlob, blobToBase64, decodeAudioBase64, base64ToArrayBuffer, downloadBlob } from './utils/audioUtils';
+import { Film, Mic, Sparkles, Sliders, AlertCircle, RefreshCw, CheckCircle2, ChevronDown, ChevronUp, FileText, Check, Zap, Layers, Download } from 'lucide-react';
 
 export default function App() {
   // 1. Initial State loaded from the example script template ("The Ides of March")
@@ -24,6 +24,9 @@ export default function App() {
 
   const [screenplay, setScreenplay] = useState<Screenplay>(defaultParse.screenplay);
   const [characterVoices, setCharacterVoices] = useState<CharacterVoice[]>(defaultParse.detectedCharacters);
+
+  // Synthesis Mode (Option 1: Chronological Multi-Speaker by default, or Option 3: Character Batch + Script Alignment)
+  const [synthesisMode, setSynthesisMode] = useState<SynthesisMode>('chronological-master');
 
   // Quick Paste Script on the Main Page
   const [quickPasteText, setQuickPasteText] = useState<string>('');
@@ -93,7 +96,8 @@ export default function App() {
         (msg, cur, tot) => {
           setProgressMessage(msg);
           setProgressPercent(Math.round(((cur + 1) / (tot + 1)) * 90));
-        }
+        },
+        synthesisMode
       );
 
       // Merge turn audios into the scene turns
@@ -137,11 +141,45 @@ export default function App() {
       console.error('[Scene Synthesis Error]', err);
       const errMsg = err?.message || 'Scene synthesis failed. Please verify API key and network connection.';
       setGlobalError(errMsg);
-      handleUpdateScene({
-        ...sceneToSynth,
-        status: 'error',
-        error: errMsg,
-      });
+
+      // If partial results were produced before quota/network error, preserve them!
+      const partial = err?.partialResult;
+      if (partial && partial.turnAudios) {
+        const updatedTurns = sceneToSynth.dialogueTurns.map((turn) => {
+          const partialAudio = partial.turnAudios[turn.id];
+          if (partialAudio) {
+            return {
+              ...turn,
+              audioBase64: partialAudio.audioBase64,
+              duration: partialAudio.duration,
+              status: 'ready' as const,
+              error: undefined,
+            };
+          }
+          return turn;
+        });
+
+        const partialScene: Scene = {
+          ...sceneToSynth,
+          audioBase64: partial.sceneAudioBase64 || sceneToSynth.audioBase64,
+          duration: partial.sceneDuration || sceneToSynth.duration,
+          dialogueTurns: updatedTurns,
+          status: partial.sceneAudioBase64 ? 'ready' : 'error',
+          error: errMsg,
+        };
+
+        handleUpdateScene(partialScene);
+        recalculateMasterTrack([
+          ...screenplay.scenes.filter((s) => s.id !== partialScene.id),
+          partialScene,
+        ]);
+      } else {
+        handleUpdateScene({
+          ...sceneToSynth,
+          status: 'error',
+          error: errMsg,
+        });
+      }
     } finally {
       setActiveSceneGeneratingId(null);
       setTimeout(() => {
@@ -235,46 +273,83 @@ export default function App() {
       setGlobalError(null);
       setIsSynthesizingAll(true);
       const totalScenes = targetScenes.length;
+      let cumulativeScenes = [...screenplay.scenes];
 
       for (let i = 0; i < totalScenes; i++) {
         const currentScene = targetScenes[i];
         setProgressMessage(`Recording Scene ${i + 1} of ${totalScenes}: ${currentScene.slug}...`);
         setProgressPercent(Math.round(((i) / totalScenes) * 100));
 
-        const result = await synthesizeFullScene(
-          currentScene,
-          voices,
-          (msg) => {
-            setProgressMessage(`[Scene ${i + 1}/${totalScenes}] ${msg}`);
-          }
-        );
+        try {
+          const result = await synthesizeFullScene(
+            currentScene,
+            voices,
+            (msg) => {
+              setProgressMessage(`[Scene ${i + 1}/${totalScenes}] ${msg}`);
+            },
+            synthesisMode
+          );
 
-        const updatedTurns = currentScene.dialogueTurns.map((turn) => {
-          const turnAudio = result.turnAudios[turn.id];
-          return {
-            ...turn,
-            audioBase64: turnAudio?.audioBase64 || turn.audioBase64,
-            duration: turnAudio?.duration || turn.duration,
-            status: 'ready' as const,
+          const updatedTurns = currentScene.dialogueTurns.map((turn) => {
+            const turnAudio = result.turnAudios[turn.id];
+            return {
+              ...turn,
+              audioBase64: turnAudio?.audioBase64 || turn.audioBase64,
+              duration: turnAudio?.duration || turn.duration,
+              status: 'ready' as const,
+            };
+          });
+
+          const updatedScene: Scene = {
+            ...currentScene,
+            audioBase64: result.sceneAudioBase64,
+            duration: result.sceneDuration,
+            dialogueTurns: updatedTurns,
+            status: 'ready',
           };
-        });
 
-        const updatedScene: Scene = {
-          ...currentScene,
-          audioBase64: result.sceneAudioBase64,
-          duration: result.sceneDuration,
-          dialogueTurns: updatedTurns,
-          status: 'ready',
-        };
+          handleUpdateScene(updatedScene);
+          cumulativeScenes = cumulativeScenes.map((s) => (s.id === updatedScene.id ? updatedScene : s));
+          recalculateMasterTrack(cumulativeScenes);
+        } catch (sceneErr: any) {
+          console.warn(`[Synthesize All] Scene ${i + 1} encountered error:`, sceneErr);
+          const partial = sceneErr?.partialResult;
+          if (partial && partial.turnAudios) {
+            const updatedTurns = currentScene.dialogueTurns.map((turn) => {
+              const partialAudio = partial.turnAudios[turn.id];
+              if (partialAudio) {
+                return {
+                  ...turn,
+                  audioBase64: partialAudio.audioBase64,
+                  duration: partialAudio.duration,
+                  status: 'ready' as const,
+                };
+              }
+              return turn;
+            });
 
-        handleUpdateScene(updatedScene);
+            const partialScene: Scene = {
+              ...currentScene,
+              audioBase64: partial.sceneAudioBase64 || currentScene.audioBase64,
+              duration: partial.sceneDuration || currentScene.duration,
+              dialogueTurns: updatedTurns,
+              status: partial.sceneAudioBase64 ? 'ready' : 'error',
+              error: sceneErr.message,
+            };
+
+            handleUpdateScene(partialScene);
+            cumulativeScenes = cumulativeScenes.map((s) => (s.id === partialScene.id ? partialScene : s));
+            recalculateMasterTrack(cumulativeScenes);
+          }
+          throw sceneErr;
+        }
       }
 
       setProgressMessage('Film vocal mastering complete! Stitched master soundtrack.');
       setProgressPercent(100);
 
-      // Re-stitch master soundtrack
-      recalculateMasterTrack(targetScenes);
+      // Final Master track recalculation
+      recalculateMasterTrack(cumulativeScenes);
     } catch (err: any) {
       console.error('[Synthesize All Error]', err);
       setGlobalError(err.message || 'Batch synthesis encountered an error. Please verify quota or network connection.');
@@ -395,6 +470,14 @@ export default function App() {
   };
 
   const completedScenesCount = screenplay.scenes.filter((s) => s.audioBase64).length;
+  const totalVoicedTurns = screenplay.scenes.reduce(
+    (acc, s) => acc + s.dialogueTurns.filter((t) => t.audioBase64).length,
+    0
+  );
+  const totalDialogueTurns = screenplay.scenes.reduce(
+    (acc, s) => acc + s.dialogueTurns.length,
+    0
+  );
   const isMasterTrackReady = masterAudioBase64 !== null;
 
   // Live breakdown of quick paste text
@@ -422,6 +505,8 @@ export default function App() {
         isSynthesizingAny={isSynthesizingAll || activeSceneGeneratingId !== null}
         completedScenesCount={completedScenesCount}
         totalScenesCount={screenplay.scenes.length}
+        totalVoicedTurns={totalVoicedTurns}
+        totalDialogueTurns={totalDialogueTurns}
         onOpenScreenplayModal={() => setIsScreenplayModalOpen(true)}
         onOpenCastingModal={() => setIsCastingModalOpen(true)}
         onOpenExportModal={() => setIsExportModalOpen(true)}
@@ -451,18 +536,74 @@ export default function App() {
         </div>
       )}
 
-      {/* Prominent Global Error Banner */}
+      {/* Prominent Global Error Banner with Partial Audio Download Support */}
       {globalError && (
-        <div className="bg-rose-950/90 border-b border-rose-800 text-xs text-rose-200 px-4 py-3 shadow-lg">
-          <div className="max-w-7xl mx-auto flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div className="bg-rose-950/95 border-b border-rose-800 text-xs text-rose-200 px-4 py-3.5 shadow-xl">
+          <div className="max-w-7xl mx-auto flex flex-col md:flex-row md:items-center justify-between gap-3">
             <div className="flex items-start gap-2.5">
               <AlertCircle className="w-5 h-5 shrink-0 text-rose-400 mt-0.5" />
               <div>
-                <strong className="block font-semibold text-rose-100">Audio Synthesis Notification</strong>
-                <span>{globalError}</span>
+                <strong className="block font-semibold text-rose-100">
+                  Audio Synthesis Status & Progress
+                </strong>
+                <span className="block mt-0.5 text-rose-200/90 leading-relaxed">{globalError}</span>
+
+                {/* Synthesis Completion Statistics */}
+                <div className="mt-2 flex items-center gap-2 flex-wrap">
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-[#160d16] border border-rose-800/60 font-mono text-[11px] text-amber-300">
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>
+                      {completedScenesCount} of {screenplay.scenes.length} scenes voiced (
+                      {Math.round((completedScenesCount / Math.max(1, screenplay.scenes.length)) * 100)}%)
+                    </span>
+                  </span>
+
+                  {totalVoicedTurns > 0 && (
+                    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-[#160d16] border border-rose-800/60 font-mono text-[11px] text-slate-300">
+                      <span>{totalVoicedTurns} dialogue turns recorded</span>
+                    </span>
+                  )}
+
+                  {masterAudioBase64 && (
+                    <span className="text-[11px] text-emerald-300 font-medium">
+                      ✓ Audio up to current point is fully preserved and stitched!
+                    </span>
+                  )}
+                </div>
               </div>
             </div>
-            <div className="flex items-center gap-2 shrink-0">
+
+            <div className="flex items-center gap-2 shrink-0 flex-wrap">
+              {/* Direct Partial Audio Master Download */}
+              {masterAudioBase64 && (
+                <button
+                  onClick={() => {
+                    const arrayBuf = base64ToArrayBuffer(masterAudioBase64);
+                    const blob = new Blob([arrayBuf], { type: 'audio/wav' });
+                    downloadBlob(
+                      blob,
+                      `${screenplay.title.replace(/[^a-zA-Z0-9_-]/g, '_')}_Partial_Progress_${completedScenesCount}_Scenes.wav`
+                    );
+                  }}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-slate-950 font-bold text-xs transition-colors shadow-md"
+                  title="Download all scenes voiced so far as a combined WAV file"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Download Voiced Audio ({completedScenesCount} Scenes)</span>
+                </button>
+              )}
+
+              {/* Open Export Station */}
+              {completedScenesCount > 0 && (
+                <button
+                  onClick={() => setIsExportModalOpen(true)}
+                  className="px-3 py-1.5 rounded-lg border border-amber-800/80 bg-amber-950/60 hover:bg-amber-900/60 text-amber-200 text-xs font-medium transition-colors"
+                >
+                  View All Voiced Clips
+                </button>
+              )}
+
+              {/* Retry */}
               <button
                 onClick={() => {
                   setGlobalError(null);
@@ -470,8 +611,10 @@ export default function App() {
                 }}
                 className="px-3 py-1.5 rounded-lg bg-rose-800 hover:bg-rose-700 text-white font-semibold text-xs transition-colors"
               >
-                Retry Request
+                Retry
               </button>
+
+              {/* Dismiss */}
               <button
                 onClick={() => setGlobalError(null)}
                 className="px-3 py-1.5 rounded-lg border border-rose-800/80 bg-rose-900/40 hover:bg-rose-900 text-rose-300 text-xs transition-colors"
@@ -625,6 +768,51 @@ Style: Controlled anger. Commanding, deliberate delivery.
 "How long shall we permit this challenge to our authority?"`}
               />
 
+              {/* Synthesis Engine Mode Selector */}
+              <div className="p-3 rounded-lg bg-[#0a0c13] border border-[#1e2538] flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="space-y-0.5">
+                  <div className="flex items-center gap-1.5 text-xs font-semibold text-amber-200">
+                    <Sliders className="w-3.5 h-3.5 text-amber-400" />
+                    <span>Synthesis Strategy Switcher:</span>
+                    <span className="text-[10px] text-amber-400/90 font-mono font-normal">
+                      {synthesisMode === 'chronological-master' ? '(Option 1: Recommended)' : '(Option 3: Character Aligned)'}
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-slate-400 leading-normal">
+                    {synthesisMode === 'chronological-master'
+                      ? '⚡ Option 1 (Default): Dual-Speaker Scene Flow — 1-2 calls per scene. Never hits 3 RPM limit. Guaranteed 100% script chronological sequence.'
+                      : '🎭 Option 3: Character Batch + Script Alignment — 1 call per character. Slices lines using text-proportional script alignment.'}
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-1.5 p-1 rounded-lg bg-[#111522] border border-[#242d42] shrink-0 self-start sm:self-auto">
+                  <button
+                    type="button"
+                    onClick={() => setSynthesisMode('chronological-master')}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-all ${
+                      synthesisMode === 'chronological-master'
+                        ? 'bg-amber-500 text-slate-950 font-bold shadow'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    <Zap className="w-3.5 h-3.5" />
+                    <span>Option 1 (Default)</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSynthesisMode('character-batch-aligned')}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-all ${
+                      synthesisMode === 'character-batch-aligned'
+                        ? 'bg-amber-500 text-slate-950 font-bold shadow'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    <Layers className="w-3.5 h-3.5" />
+                    <span>Option 3 (Batch Aligned)</span>
+                  </button>
+                </div>
+              </div>
+
               {/* Live parser summary and generate button */}
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-1">
                 <div className="flex items-center gap-2 flex-wrap text-xs">
@@ -767,7 +955,25 @@ Style: Controlled anger. Commanding, deliberate delivery.
                 Screenplay Scenes & Dialogue Turns
               </h2>
             </div>
-            <div className="flex items-center gap-3 text-xs text-slate-400">
+            <div className="flex items-center gap-2.5 text-xs text-slate-400">
+              <button
+                type="button"
+                onClick={() => setSynthesisMode(synthesisMode === 'chronological-master' ? 'character-batch-aligned' : 'chronological-master')}
+                className="px-2.5 py-1 rounded border border-[#28334a] bg-[#121624] hover:bg-[#181e30] text-[10px] text-amber-300 font-mono flex items-center gap-1.5 transition-colors"
+                title="Click to switch between Option 1 (Dual-Speaker Flow) and Option 3 (Character Batch Aligned)"
+              >
+                {synthesisMode === 'chronological-master' ? (
+                  <>
+                    <Zap className="w-3 h-3 text-amber-400" />
+                    <span>Mode: Option 1 (Dual-Speaker)</span>
+                  </>
+                ) : (
+                  <>
+                    <Layers className="w-3 h-3 text-sky-400" />
+                    <span>Mode: Option 3 (Batch Aligned)</span>
+                  </>
+                )}
+              </button>
               <span className="font-mono">
                 {screenplay.scenes.length} Scenes /{' '}
                 {screenplay.scenes.reduce((acc, s) => acc + s.dialogueTurns.length, 0)} Turns

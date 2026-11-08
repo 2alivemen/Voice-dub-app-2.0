@@ -4,8 +4,11 @@ import {
   stitchAudioBuffers,
   audioBufferToWavBlob,
   blobToBase64,
+  alignAudioBufferToTurns,
 } from '../utils/audioUtils';
 import { sanitizeDialogueTextForTTS } from '../utils/screenplayParser';
+
+export type SynthesisMode = 'chronological-master' | 'character-batch-aligned';
 
 export interface TTSApiResponse {
   audioBase64: string;
@@ -110,18 +113,57 @@ export async function synthesizeSingleTurn(
 }
 
 /**
- * Synthesizes an entire scene in exact chronological screenplay order:
- * - Iterates strictly through dialogue turns in script sequence (Turn 1, Turn 2, Turn 3...).
- * - Caches and reuses already-voiced turns so repeated attempts or retakes don't waste API quota.
- * - Paces requests (1.2s delay) to stay comfortably within rate limits, while the backend's
- *   exponential backoff handles any transient rate limits seamlessly.
- * - Sanitizes all pause directives ([pause: 50ms], (pause 50ms), etc.) to natural speech pauses (...).
- * - Stitches all individual turn audio takes into a master soundtrack in 100% script sequence.
+ * Partitions dialogue turns into consecutive chunks where each chunk contains
+ * at most 2 unique speakers (Gemini's dual-speaker limit), preserving strict script order.
+ */
+export function partitionTurnsIntoTwoSpeakerChunks(turns: DialogueTurn[]): DialogueTurn[][] {
+  const chunks: DialogueTurn[][] = [];
+  let currentChunk: DialogueTurn[] = [];
+  let currentSpeakers = new Set<string>();
+
+  for (const turn of turns) {
+    const spk = turn.speaker.trim().toUpperCase();
+    const wouldHaveSpeakers = new Set(currentSpeakers);
+    wouldHaveSpeakers.add(spk);
+
+    if (wouldHaveSpeakers.size > 2) {
+      if (currentChunk.length > 0) {
+        chunks.push(currentChunk);
+      }
+      currentChunk = [turn];
+      currentSpeakers = new Set([spk]);
+    } else {
+      currentChunk.push(turn);
+      currentSpeakers.add(spk);
+    }
+  }
+
+  if (currentChunk.length > 0) {
+    chunks.push(currentChunk);
+  }
+
+  return chunks;
+}
+
+/**
+ * Synthesizes an entire scene using the user's selected synthesis mode:
+ *
+ * Option 1 (Default - 'chronological-master'):
+ * - Partitions turns into minimal dual-speaker chunks chronologically.
+ * - Minimizes API requests (1-2 calls per scene) to prevent rate limits.
+ * - Guarantees 100% chronological dialogue flow without jumbling.
+ * - Slices chunk buffers using text-anchored acoustic windows so each dialogue card is playable.
+ *
+ * Option 3 ('character-batch-aligned'):
+ * - Collects all lines per character (1 call per character).
+ * - Slices batched audio using text-proportional script alignment.
+ * - Reorganizes and stitches all takes in screenplay sequence.
  */
 export async function synthesizeFullScene(
   scene: Scene,
   characterVoices: CharacterVoice[],
-  onProgress?: (progressText: string, current: number, total: number) => void
+  onProgress?: (progressText: string, current: number, total: number) => void,
+  mode: SynthesisMode = 'chronological-master'
 ): Promise<{
   sceneAudioBase64: string;
   sceneDuration: number;
@@ -136,62 +178,220 @@ export async function synthesizeFullScene(
     };
   }
 
-  const totalTurns = scene.dialogueTurns.length;
+  // Build voice assignment map for all characters
+  const voiceMap: Record<string, { voiceName: GeminiPrebuiltVoice; basePersonality?: string }> = {};
+  for (const cv of characterVoices) {
+    voiceMap[cv.name.trim()] = {
+      voiceName: cv.voiceName,
+      basePersonality: cv.basePersonality,
+    };
+  }
+
   const turnAudios: Record<string, { audioBase64: string; duration: number }> = {};
-  const orderedTurnBuffers: AudioBuffer[] = [];
 
-  // Synthesize each turn in guaranteed chronological sequence
-  for (let i = 0; i < totalTurns; i++) {
-    const turn = scene.dialogueTurns[i];
-    const speaker = turn.speaker.trim();
+  if (mode === 'chronological-master') {
+    // ==========================================
+    // OPTION 1 (DEFAULT): CHRONOLOGICAL MULTI-SPEAKER FLOW
+    // ==========================================
+    const chunks = partitionTurnsIntoTwoSpeakerChunks(scene.dialogueTurns);
+    const totalChunks = chunks.length;
+    const chunkBuffers: AudioBuffer[] = [];
+    let caughtError: any = null;
 
-    onProgress?.(
-      `Voicing Line ${i + 1}/${totalTurns} (${speaker})...`,
-      i,
-      totalTurns
-    );
+    for (let cIdx = 0; cIdx < totalChunks; cIdx++) {
+      const chunkTurns = chunks[cIdx];
+      const chunkSpeakers = Array.from(new Set(chunkTurns.map((t) => t.speaker.trim())));
 
-    // If turn was already recorded and has valid audio, reuse it to save API calls
-    if (turn.audioBase64 && turn.duration && turn.duration > 0) {
+      onProgress?.(
+        `Voicing Scene ${scene.sceneNumber} Section ${cIdx + 1}/${totalChunks} (${chunkSpeakers.join(' & ')})...`,
+        cIdx,
+        totalChunks
+      );
+
+      if (cIdx > 0) {
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
+
       try {
-        const cachedBuffer = await decodeAudioBase64(turn.audioBase64);
-        turnAudios[turn.id] = {
-          audioBase64: turn.audioBase64,
-          duration: turn.duration,
-        };
-        orderedTurnBuffers.push(cachedBuffer);
-        continue;
-      } catch {
-        // If decoding cached audio fails, regenerate this turn below
+        const payload = chunkTurns.map((turn) => ({
+          id: turn.id,
+          speaker: turn.speaker.trim(),
+          text: sanitizeDialogueTextForTTS(turn.text),
+          emotion: turn.emotion.trim(),
+          vocalizeSpeakerName: turn.vocalizeSpeakerName ?? false,
+        }));
+
+        const result = await callBackendSynthesize(payload, voiceMap);
+        const chunkBuffer = await decodeAudioBase64(result.audioBase64);
+        chunkBuffers.push(chunkBuffer);
+
+        // Slices chunk into takes for each turn card using script-proportional acoustic windows
+        const slicedTakes = alignAudioBufferToTurns(
+          chunkBuffer,
+          chunkTurns.map((t) => t.text)
+        );
+
+        for (let s = 0; s < chunkTurns.length; s++) {
+          const turn = chunkTurns[s];
+          const segBuf = slicedTakes[s];
+          const wavBlob = audioBufferToWavBlob(segBuf);
+          const segBase64 = await blobToBase64(wavBlob);
+
+          turnAudios[turn.id] = {
+            audioBase64: segBase64,
+            duration: segBuf.duration,
+          };
+        }
+      } catch (err: any) {
+        console.warn(`[synthesizeFullScene] Section ${cIdx + 1}/${totalChunks} failed:`, err);
+        caughtError = err;
+        break; // Stop remaining chunks, but preserve audio generated so far!
       }
     }
 
-    // Pacing pause between API calls to stay within free-tier RPM limits
-    if (i > 0) {
-      await new Promise((resolve) => setTimeout(resolve, 1200));
+    let sceneAudioBase64 = '';
+    let sceneDuration = 0;
+
+    if (chunkBuffers.length > 0) {
+      const stitchedBuffer = stitchAudioBuffers(chunkBuffers, 0.25);
+      const masterBlob = audioBufferToWavBlob(stitchedBuffer);
+      sceneAudioBase64 = await blobToBase64(masterBlob);
+      sceneDuration = stitchedBuffer.duration;
     }
 
-    // Synthesize turn take
-    const singleResult = await synthesizeSingleTurn(turn, characterVoices);
-    const buf = await decodeAudioBase64(singleResult.audioBase64);
+    if (caughtError) {
+      // Attach the partial results to the error so caller can preserve them
+      caughtError.partialResult = {
+        sceneAudioBase64,
+        sceneDuration,
+        turnAudios,
+        completedChunks: chunkBuffers.length,
+        totalChunks,
+      };
+      throw caughtError;
+    }
 
-    turnAudios[turn.id] = {
-      audioBase64: singleResult.audioBase64,
-      duration: buf.duration,
+    return {
+      sceneAudioBase64,
+      sceneDuration,
+      turnAudios,
     };
-    orderedTurnBuffers.push(buf);
+  } else {
+    // ==========================================
+    // OPTION 3: CHARACTER BATCH WITH SCRIPT ALIGNMENT
+    // ==========================================
+    const turnsBySpeaker: Record<string, DialogueTurn[]> = {};
+    for (const turn of scene.dialogueTurns) {
+      const spk = turn.speaker.trim();
+      if (!turnsBySpeaker[spk]) {
+        turnsBySpeaker[spk] = [];
+      }
+      turnsBySpeaker[spk].push(turn);
+    }
+
+    const uniqueSpeakers = Object.keys(turnsBySpeaker);
+    const totalChars = uniqueSpeakers.length;
+    const turnBuffersById: Record<string, AudioBuffer> = {};
+
+    let caughtError: any = null;
+
+    for (let cIdx = 0; cIdx < totalChars; cIdx++) {
+      const speaker = uniqueSpeakers[cIdx];
+      const charTurns = turnsBySpeaker[speaker];
+
+      onProgress?.(
+        `Voicing Character ${cIdx + 1}/${totalChars}: ${speaker} (${charTurns.length} line${charTurns.length > 1 ? 's' : ''})...`,
+        cIdx,
+        totalChars
+      );
+
+      if (cIdx > 0) {
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
+
+      try {
+        if (charTurns.length === 1) {
+          const singleResult = await synthesizeSingleTurn(charTurns[0], characterVoices);
+          const buf = await decodeAudioBase64(singleResult.audioBase64);
+          turnAudios[charTurns[0].id] = singleResult;
+          turnBuffersById[charTurns[0].id] = buf;
+        } else {
+          const payload = charTurns.map((turn, idx) => {
+            let lineText = sanitizeDialogueTextForTTS(turn.text);
+            if (idx < charTurns.length - 1) {
+              lineText = `${lineText} ... ... `;
+            }
+            return {
+              id: turn.id,
+              speaker,
+              text: lineText,
+              emotion: turn.emotion.trim(),
+              vocalizeSpeakerName: turn.vocalizeSpeakerName ?? false,
+            };
+          });
+
+          const result = await callBackendSynthesize(payload, voiceMap);
+          const combinedBuffer = await decodeAudioBase64(result.audioBase64);
+
+          const segments = alignAudioBufferToTurns(
+            combinedBuffer,
+            charTurns.map((t) => t.text)
+          );
+
+          for (let s = 0; s < charTurns.length; s++) {
+            const turn = charTurns[s];
+            const segBuf = segments[s];
+            const wavBlob = audioBufferToWavBlob(segBuf);
+            const segBase64 = await blobToBase64(wavBlob);
+
+            turnAudios[turn.id] = {
+              audioBase64: segBase64,
+              duration: segBuf.duration,
+            };
+            turnBuffersById[turn.id] = segBuf;
+          }
+        }
+      } catch (err: any) {
+        console.warn(`[synthesizeFullScene] Character ${speaker} failed:`, err);
+        caughtError = err;
+        break; // Stop remaining characters, preserve audio generated so far!
+      }
+    }
+
+    onProgress?.(`Reorganizing & Mastering Scene ${scene.sceneNumber} in script order...`, totalChars, totalChars);
+
+    const orderedTurnBuffers: AudioBuffer[] = [];
+    for (const turn of scene.dialogueTurns) {
+      const buf = turnBuffersById[turn.id];
+      if (buf) {
+        orderedTurnBuffers.push(buf);
+      }
+    }
+
+    let sceneAudioBase64 = '';
+    let sceneDuration = 0;
+
+    if (orderedTurnBuffers.length > 0) {
+      const stitchedBuffer = stitchAudioBuffers(orderedTurnBuffers, 0.25);
+      const wavBlob = audioBufferToWavBlob(stitchedBuffer);
+      sceneAudioBase64 = await blobToBase64(wavBlob);
+      sceneDuration = stitchedBuffer.duration;
+    }
+
+    if (caughtError) {
+      caughtError.partialResult = {
+        sceneAudioBase64,
+        sceneDuration,
+        turnAudios,
+        completedChars: Object.keys(turnBuffersById).length,
+      };
+      throw caughtError;
+    }
+
+    return {
+      sceneAudioBase64,
+      sceneDuration,
+      turnAudios,
+    };
   }
-
-  // Master all turn buffers in the EXACT original screenplay sequence!
-  onProgress?.(`Mastering Scene ${scene.sceneNumber} in script order...`, totalTurns, totalTurns);
-
-  const stitchedBuffer = stitchAudioBuffers(orderedTurnBuffers, 0.25);
-  const wavBlob = audioBufferToWavBlob(stitchedBuffer);
-  const sceneAudioBase64 = await blobToBase64(wavBlob);
-
-  return {
-    sceneAudioBase64,
-    sceneDuration: stitchedBuffer.duration,
-    turnAudios,
-  };
 }

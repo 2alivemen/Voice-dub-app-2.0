@@ -141,12 +141,12 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                 {isZipping ? (
                   <>
                     <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                    <span>Packaging Master Archive...</span>
+                    <span>Packaging Voiced Archive...</span>
                   </>
                 ) : (
                   <>
                     <Download className="w-4 h-4" />
-                    <span>Download Full ZIP Package</span>
+                    <span>Download Voiced ZIP ({completedScenes.length}/{scenes.length} Scenes)</span>
                   </>
                 )}
               </button>
@@ -157,7 +157,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               <div>
                 <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-amber-400 mb-1">
                   <Disc3 className="w-4 h-4" />
-                  <span>Combined Master Soundtrack (.WAV)</span>
+                  <span>Combined Master Soundtrack ({completedScenes.length} Voiced Scenes)</span>
                 </div>
                 <p className="text-xs text-slate-400">
                   Concatenates all completed scenes into one continuous, seamlessly mastered film audio file with room silence gaps.
@@ -190,7 +190,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                 ) : (
                   <>
                     <Disc3 className="w-4 h-4" />
-                    <span>Download Master Soundtrack WAV</span>
+                    <span>Download Master Audio ({completedScenes.length}/{scenes.length} Scenes)</span>
                   </>
                 )}
               </button>

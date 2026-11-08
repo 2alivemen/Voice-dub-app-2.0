@@ -1,5 +1,5 @@
 import React from 'react';
-import { Film, Mic, Download, Play, Sliders, FileText, CheckCircle2, AlertCircle, RefreshCw } from 'lucide-react';
+import { Film, Mic, Download, Play, Sliders, FileText, CheckCircle2, AlertCircle, RefreshCw, BookOpen } from 'lucide-react';
 import { Screenplay } from '../types/screenplay';
 
 interface HeaderProps {
@@ -8,9 +8,12 @@ interface HeaderProps {
   isSynthesizingAny: boolean;
   completedScenesCount: number;
   totalScenesCount: number;
+  totalVoicedTurns?: number;
+  totalDialogueTurns?: number;
   onOpenScreenplayModal: () => void;
   onOpenCastingModal: () => void;
   onOpenExportModal: () => void;
+  onOpenGuideModal?: () => void;
   onSynthesizeAllScenes: () => void;
   onPlayMasterTrack: () => void;
   isMasterTrackReady: boolean;
@@ -22,9 +25,12 @@ export const Header: React.FC<HeaderProps> = ({
   isSynthesizingAny,
   completedScenesCount,
   totalScenesCount,
+  totalVoicedTurns,
+  totalDialogueTurns,
   onOpenScreenplayModal,
   onOpenCastingModal,
   onOpenExportModal,
+  onOpenGuideModal,
   onSynthesizeAllScenes,
   onPlayMasterTrack,
   isMasterTrackReady,
@@ -48,13 +54,14 @@ export const Header: React.FC<HeaderProps> = ({
                 Gemini 3.8 TTS
               </span>
             </div>
-            <div className="flex items-center gap-2 text-xs text-slate-400">
+            <div className="flex items-center gap-2 text-xs text-slate-400 flex-wrap">
               <span className="font-medium text-slate-300">{screenplay.title}</span>
               <span>•</span>
               <span className="text-slate-400 italic">{screenplay.periodOrEra}</span>
               <span>•</span>
-              <span className="font-mono text-slate-400">
-                {completedScenesCount} of {totalScenesCount} scenes voiced
+              <span className="font-mono text-slate-300 bg-[#161a26] px-2 py-0.5 rounded border border-[#232a3e]">
+                {completedScenesCount} of {totalScenesCount} scenes ({Math.round((completedScenesCount / Math.max(1, totalScenesCount)) * 100)}%)
+                {totalVoicedTurns !== undefined && totalDialogueTurns !== undefined ? ` • ${totalVoicedTurns}/${totalDialogueTurns} turns` : ''}
               </span>
             </div>
           </div>
@@ -74,6 +81,15 @@ export const Header: React.FC<HeaderProps> = ({
             {hasApiKey ? <CheckCircle2 className="w-3.5 h-3.5" /> : <AlertCircle className="w-3.5 h-3.5" />}
             <span>{hasApiKey ? 'TTS Engine Live' : 'API Key Missing'}</span>
           </div>
+
+          {/* Writer's Guide button */}
+          <button
+            onClick={onOpenGuideModal}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-amber-900/50 bg-amber-950/20 hover:bg-amber-950/40 text-xs font-medium text-amber-300 transition-colors shadow-sm"
+          >
+            <BookOpen className="w-3.5 h-3.5 text-amber-400" />
+            <span>Writer's Guide</span>
+          </button>
 
           {/* Screenplay button */}
           <button

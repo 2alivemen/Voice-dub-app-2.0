@@ -240,6 +240,132 @@ export function splitAudioBufferIntoSegments(
   return segments;
 }
 
+/**
+ * Intelligently aligns and slices a combined AudioBuffer to individual dialogue turns
+ * using Script Text Proportions & Acoustic Energy Windows:
+ * 1. Computes the expected boundary points based on the relative character/word length of each line in the script.
+ * 2. Constrains silence/pause detection to a narrow window centered around the script-predicted boundary.
+ * 3. This prevents intra-sentence pauses from causing premature splits and prevents words from being cut in half!
+ */
+export function alignAudioBufferToTurns(
+  buffer: AudioBuffer,
+  turnTexts: string[],
+  minSilenceSec = 0.2,
+  amplitudeThreshold = 0.04
+): AudioBuffer[] {
+  const ctx = getAudioContext();
+  const numSegments = turnTexts.length;
+
+  if (numSegments <= 1 || buffer.duration <= 0.1) {
+    return [buffer];
+  }
+
+  const sampleRate = buffer.sampleRate;
+  const numChannels = buffer.numberOfChannels;
+  const channelData = buffer.getChannelData(0);
+  const totalSamples = buffer.length;
+
+  // 1. Compute script text length proportions
+  const textWeights = turnTexts.map((txt) => Math.max(12, txt.trim().length));
+  const totalWeight = textWeights.reduce((acc, w) => acc + w, 0);
+
+  // Cumulative expected boundary ratios
+  const expectedBoundarySamples: number[] = [];
+  let currentCum = 0;
+  for (let i = 0; i < numSegments - 1; i++) {
+    currentCum += textWeights[i];
+    const ratio = currentCum / totalWeight;
+    expectedBoundarySamples.push(Math.floor(ratio * totalSamples));
+  }
+
+  // 2. Search for the optimal silence/low-energy split point around each expected boundary
+  const splitIndices: number[] = [];
+  const minSilenceSamples = Math.floor(sampleRate * minSilenceSec);
+
+  // Average segment length in samples
+  const avgSegmentSamples = Math.floor(totalSamples / numSegments);
+  const searchTolerance = Math.floor(avgSegmentSamples * 0.35); // search within +/- 35% of an average line
+
+  for (let b = 0; b < expectedBoundarySamples.length; b++) {
+    const centerSample = expectedBoundarySamples[b];
+    const prevBound = b === 0 ? 0 : splitIndices[b - 1];
+    const minSearch = Math.max(prevBound + Math.floor(sampleRate * 0.25), centerSample - searchTolerance);
+    const maxSearch = Math.min(totalSamples - Math.floor(sampleRate * 0.25), centerSample + searchTolerance);
+
+    // Locate silence regions within the constrained search window
+    let bestSplit = centerSample;
+    let foundSilence = false;
+    let maxSilenceDuration = 0;
+
+    let inSilence = false;
+    let silenceStart = minSearch;
+
+    for (let i = minSearch; i < maxSearch; i++) {
+      const isSilent = Math.abs(channelData[i]) < amplitudeThreshold;
+      if (isSilent) {
+        if (!inSilence) {
+          silenceStart = i;
+          inSilence = true;
+        }
+      } else {
+        if (inSilence) {
+          const duration = i - silenceStart;
+          if (duration >= minSilenceSamples && duration > maxSilenceDuration) {
+            maxSilenceDuration = duration;
+            bestSplit = Math.floor(silenceStart + duration / 2);
+            foundSilence = true;
+          }
+          inSilence = false;
+        }
+      }
+    }
+
+    // If no distinct silence region was found, find the point of minimum root-mean-square amplitude in window
+    if (!foundSilence) {
+      const step = Math.floor(sampleRate * 0.02); // 20ms steps
+      let minRms = Infinity;
+      let minRmsSample = centerSample;
+
+      for (let s = minSearch; s < maxSearch - step; s += step) {
+        let sumSquare = 0;
+        for (let k = 0; k < step; k++) {
+          const val = channelData[s + k];
+          sumSquare += val * val;
+        }
+        const rms = Math.sqrt(sumSquare / step);
+        if (rms < minRms) {
+          minRms = rms;
+          minRmsSample = s + Math.floor(step / 2);
+        }
+      }
+      bestSplit = minRmsSample;
+    }
+
+    splitIndices.push(bestSplit);
+  }
+
+  // 3. Slice into individual AudioBuffers
+  const segments: AudioBuffer[] = [];
+  let startSample = 0;
+
+  for (let s = 0; s < numSegments; s++) {
+    const endSample = s < splitIndices.length ? splitIndices[s] : totalSamples;
+    const segmentLength = Math.max(1, endSample - startSample);
+    const segmentBuffer = ctx.createBuffer(numChannels, segmentLength, sampleRate);
+
+    for (let c = 0; c < numChannels; c++) {
+      const srcData = buffer.getChannelData(c);
+      const destData = segmentBuffer.getChannelData(c);
+      destData.set(srcData.subarray(startSample, endSample));
+    }
+
+    segments.push(segmentBuffer);
+    startSample = endSample;
+  }
+
+  return segments;
+}
+
 // Trigger browser download for Blob
 export function downloadBlob(blob: Blob, fileName: string) {
   const url = URL.createObjectURL(blob);
