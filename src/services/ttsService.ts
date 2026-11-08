@@ -319,7 +319,11 @@ export async function synthesizeFullScene(
           const payload = charTurns.map((turn, idx) => {
             let lineText = sanitizeDialogueTextForTTS(turn.text);
             if (idx < charTurns.length - 1) {
-              lineText = `${lineText} ... ... `;
+              // Ensure clean sentence ending and a clear breath pause so Gemini produces a distinct silence
+              if (!/[.!?।]$/.test(lineText)) {
+                lineText = `${lineText}.`;
+              }
+              lineText = `${lineText}\n\n[pause: 800ms]\n\n`;
             }
             return {
               id: turn.id,

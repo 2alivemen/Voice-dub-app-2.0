@@ -250,8 +250,8 @@ export function splitAudioBufferIntoSegments(
 export function alignAudioBufferToTurns(
   buffer: AudioBuffer,
   turnTexts: string[],
-  minSilenceSec = 0.2,
-  amplitudeThreshold = 0.04
+  minSilenceSec = 0.18,
+  amplitudeThreshold = 0.035
 ): AudioBuffer[] {
   const ctx = getAudioContext();
   const numSegments = turnTexts.length;
@@ -265,66 +265,81 @@ export function alignAudioBufferToTurns(
   const channelData = buffer.getChannelData(0);
   const totalSamples = buffer.length;
 
-  // 1. Compute script text length proportions
-  const textWeights = turnTexts.map((txt) => Math.max(12, txt.trim().length));
+  // 1. Compute script text length proportions:
+  // Short exclamations like "ಅಷ್ಟೊಂದು!" (9 chars) still take ~1.2s to speak plus the 800ms pause.
+  // Adding a base acoustic overhead (+22 chars equivalent) ensures short lines receive an accurate time slice
+  // and are never skipped or collapsed into neighboring lines!
+  const textWeights = turnTexts.map((txt) => txt.trim().length + 22);
   const totalWeight = textWeights.reduce((acc, w) => acc + w, 0);
 
-  // Cumulative expected boundary ratios
-  const expectedBoundarySamples: number[] = [];
-  let currentCum = 0;
+  // Cumulative expected boundary positions
+  let cum = 0;
+  const expectedBoundaries: number[] = [];
   for (let i = 0; i < numSegments - 1; i++) {
-    currentCum += textWeights[i];
-    const ratio = currentCum / totalWeight;
-    expectedBoundarySamples.push(Math.floor(ratio * totalSamples));
+    cum += textWeights[i];
+    expectedBoundaries.push(Math.floor((cum / totalWeight) * totalSamples));
   }
 
-  // 2. Search for the optimal silence/low-energy split point around each expected boundary
-  const splitIndices: number[] = [];
+  // 2. Discover all distinct acoustic silence regions in the entire audio buffer
   const minSilenceSamples = Math.floor(sampleRate * minSilenceSec);
+  const detectedGaps: Array<{ start: number; end: number; mid: number; duration: number }> = [];
+  let inSilence = false;
+  let sStart = 0;
 
-  // Average segment length in samples
-  const avgSegmentSamples = Math.floor(totalSamples / numSegments);
-  const searchTolerance = Math.floor(avgSegmentSamples * 0.35); // search within +/- 35% of an average line
-
-  for (let b = 0; b < expectedBoundarySamples.length; b++) {
-    const centerSample = expectedBoundarySamples[b];
-    const prevBound = b === 0 ? 0 : splitIndices[b - 1];
-    const minSearch = Math.max(prevBound + Math.floor(sampleRate * 0.25), centerSample - searchTolerance);
-    const maxSearch = Math.min(totalSamples - Math.floor(sampleRate * 0.25), centerSample + searchTolerance);
-
-    // Locate silence regions within the constrained search window
-    let bestSplit = centerSample;
-    let foundSilence = false;
-    let maxSilenceDuration = 0;
-
-    let inSilence = false;
-    let silenceStart = minSearch;
-
-    for (let i = minSearch; i < maxSearch; i++) {
-      const isSilent = Math.abs(channelData[i]) < amplitudeThreshold;
-      if (isSilent) {
-        if (!inSilence) {
-          silenceStart = i;
-          inSilence = true;
+  for (let i = 0; i < totalSamples; i++) {
+    const isSilent = Math.abs(channelData[i]) < amplitudeThreshold;
+    if (isSilent) {
+      if (!inSilence) {
+        sStart = i;
+        inSilence = true;
+      }
+    } else {
+      if (inSilence) {
+        const len = i - sStart;
+        if (len >= minSilenceSamples) {
+          detectedGaps.push({
+            start: sStart,
+            end: i,
+            mid: Math.floor(sStart + len / 2),
+            duration: len,
+          });
         }
-      } else {
-        if (inSilence) {
-          const duration = i - silenceStart;
-          if (duration >= minSilenceSamples && duration > maxSilenceDuration) {
-            maxSilenceDuration = duration;
-            bestSplit = Math.floor(silenceStart + duration / 2);
-            foundSilence = true;
-          }
-          inSilence = false;
-        }
+        inSilence = false;
       }
     }
+  }
 
-    // If no distinct silence region was found, find the point of minimum root-mean-square amplitude in window
-    if (!foundSilence) {
-      const step = Math.floor(sampleRate * 0.02); // 20ms steps
+  // 3. Sequentially match each script boundary to the best real acoustic pause gap
+  const splitIndices: number[] = [];
+  let lastSplitSample = 0;
+
+  for (let b = 0; b < expectedBoundaries.length; b++) {
+    const target = expectedBoundaries[b];
+    const remainingSegmentsAfter = expectedBoundaries.length - 1 - b;
+
+    // Filter candidate gaps that occur after the previous split (+ minimum 0.15s speech for short exclamations)
+    // and leave enough room for subsequent segments
+    const candidateGaps = detectedGaps.filter(
+      (g) =>
+        g.mid > lastSplitSample + Math.floor(sampleRate * 0.15) &&
+        totalSamples - g.mid >= remainingSegmentsAfter * Math.floor(sampleRate * 0.15)
+    );
+
+    if (candidateGaps.length > 0) {
+      // Pick the gap closest to the script-predicted boundary
+      candidateGaps.sort((g1, g2) => Math.abs(g1.mid - target) - Math.abs(g2.mid - target));
+      const chosenGap = candidateGaps[0];
+      splitIndices.push(chosenGap.mid);
+      lastSplitSample = chosenGap.mid;
+    } else {
+      // Fallback: search a localized 20ms RMS minimum window
+      const searchWindow = Math.floor(sampleRate * 0.5);
+      const minSearch = Math.max(lastSplitSample + Math.floor(sampleRate * 0.3), target - searchWindow);
+      const maxSearch = Math.min(totalSamples - Math.floor(sampleRate * 0.3), target + searchWindow);
+
+      const step = Math.floor(sampleRate * 0.02);
       let minRms = Infinity;
-      let minRmsSample = centerSample;
+      let minRmsSample = target;
 
       for (let s = minSearch; s < maxSearch - step; s += step) {
         let sumSquare = 0;
@@ -338,13 +353,13 @@ export function alignAudioBufferToTurns(
           minRmsSample = s + Math.floor(step / 2);
         }
       }
-      bestSplit = minRmsSample;
-    }
 
-    splitIndices.push(bestSplit);
+      splitIndices.push(minRmsSample);
+      lastSplitSample = minRmsSample;
+    }
   }
 
-  // 3. Slice into individual AudioBuffers
+  // 4. Slice into individual AudioBuffers for each dialogue line
   const segments: AudioBuffer[] = [];
   let startSample = 0;
 
