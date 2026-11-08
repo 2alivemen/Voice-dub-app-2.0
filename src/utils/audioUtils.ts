@@ -309,53 +309,100 @@ export function alignAudioBufferToTurns(
     }
   }
 
-  // 3. Sequentially match each script boundary to the best real acoustic pause gap
-  const splitIndices: number[] = [];
-  let lastSplitSample = 0;
+  // 3. Globally Optimal Sequence Alignment using Dynamic Programming
+  // Rather than making greedy independent choices that can get tricked by short words or comma pauses,
+  // we find the global set of (numSegments - 1) pause gaps that jointly minimizes distance to expected
+  // script boundaries while strongly favoring true inter-line pauses (which have longer duration due to [pause: 800ms]).
+  const K = expectedBoundaries.length;
+  let splitIndices: number[] = [];
 
-  for (let b = 0; b < expectedBoundaries.length; b++) {
-    const target = expectedBoundaries[b];
-    const remainingSegmentsAfter = expectedBoundaries.length - 1 - b;
+  const minMargin = Math.floor(sampleRate * 0.15);
+  const minSpeechSamples = Math.floor(sampleRate * 0.15); // Accommodate quick 1-word responses like "ಹೌದು" or "ಹೂ ಮತ್ತೆ"
+  const validGaps = detectedGaps.filter(
+    (g) => g.mid >= minMargin && g.mid <= totalSamples - minMargin
+  );
 
-    // Filter candidate gaps that occur after the previous split (+ minimum 0.15s speech for short exclamations)
-    // and leave enough room for subsequent segments
-    const candidateGaps = detectedGaps.filter(
-      (g) =>
-        g.mid > lastSplitSample + Math.floor(sampleRate * 0.15) &&
-        totalSamples - g.mid >= remainingSegmentsAfter * Math.floor(sampleRate * 0.15)
-    );
+  if (validGaps.length >= K && K > 0) {
+    // DP state: dp[k][i] = minimum cost to assign the first (k+1) boundaries such that boundary k is validGaps[i]
+    const dp: number[][] = Array.from({ length: K }, () => Array(validGaps.length).fill(Infinity));
+    const parent: number[][] = Array.from({ length: K }, () => Array(validGaps.length).fill(-1));
 
-    if (candidateGaps.length > 0) {
-      // Pick the gap closest to the script-predicted boundary
-      candidateGaps.sort((g1, g2) => Math.abs(g1.mid - target) - Math.abs(g2.mid - target));
-      const chosenGap = candidateGaps[0];
-      splitIndices.push(chosenGap.mid);
-      lastSplitSample = chosenGap.mid;
-    } else {
-      // Fallback: search a localized 20ms RMS minimum window
-      const searchWindow = Math.floor(sampleRate * 0.5);
-      const minSearch = Math.max(lastSplitSample + Math.floor(sampleRate * 0.3), target - searchWindow);
-      const maxSearch = Math.min(totalSamples - Math.floor(sampleRate * 0.3), target + searchWindow);
+    // Base step k = 0 (first boundary)
+    for (let i = 0; i < validGaps.length; i++) {
+      const g = validGaps[i];
+      const dist = Math.abs(g.mid - expectedBoundaries[0]);
+      // Strongly reward longer pause duration (inter-line gap with [pause: 800ms] is much wider than a comma)
+      const pauseDurationSec = g.duration / sampleRate;
+      const pauseBonus = Math.min(pauseDurationSec, 1.2) * (sampleRate * 0.7);
+      dp[0][i] = dist - pauseBonus;
+    }
 
-      const step = Math.floor(sampleRate * 0.02);
-      let minRms = Infinity;
-      let minRmsSample = target;
+    // Transitions for k = 1 to K - 1
+    for (let k = 1; k < K; k++) {
+      const target = expectedBoundaries[k];
+      for (let i = k; i < validGaps.length; i++) {
+        const gCurrent = validGaps[i];
+        const dist = Math.abs(gCurrent.mid - target);
+        const pauseDurationSec = gCurrent.duration / sampleRate;
+        const pauseBonus = Math.min(pauseDurationSec, 1.2) * (sampleRate * 0.7);
+        const currentCost = dist - pauseBonus;
 
-      for (let s = minSearch; s < maxSearch - step; s += step) {
-        let sumSquare = 0;
-        for (let k = 0; k < step; k++) {
-          const val = channelData[s + k];
-          sumSquare += val * val;
-        }
-        const rms = Math.sqrt(sumSquare / step);
-        if (rms < minRms) {
-          minRms = rms;
-          minRmsSample = s + Math.floor(step / 2);
+        for (let p = k - 1; p < i; p++) {
+          const gPrev = validGaps[p];
+          if (gCurrent.mid >= gPrev.mid + minSpeechSamples) {
+            const totalCost = dp[k - 1][p] + currentCost;
+            if (totalCost < dp[k][i]) {
+              dp[k][i] = totalCost;
+              parent[k][i] = p;
+            }
+          }
         }
       }
+    }
 
-      splitIndices.push(minRmsSample);
-      lastSplitSample = minRmsSample;
+    // Find best ending index for boundary K - 1
+    let bestEndIdx = -1;
+    let minFinalCost = Infinity;
+    for (let i = K - 1; i < validGaps.length; i++) {
+      if (dp[K - 1][i] < minFinalCost) {
+        minFinalCost = dp[K - 1][i];
+        bestEndIdx = i;
+      }
+    }
+
+    if (bestEndIdx !== -1) {
+      splitIndices = new Array(K);
+      let curr = bestEndIdx;
+      for (let k = K - 1; k >= 0; k--) {
+        splitIndices[k] = validGaps[curr].mid;
+        curr = parent[k][curr];
+      }
+    }
+  }
+
+  // Fallback: If DP found fewer gaps than needed, fall back to sequential closest-gap search
+  if (splitIndices.length < K) {
+    splitIndices = [];
+    let lastSplitSample = 0;
+    for (let b = 0; b < expectedBoundaries.length; b++) {
+      const target = expectedBoundaries[b];
+      const remainingSegmentsAfter = expectedBoundaries.length - 1 - b;
+
+      const candidateGaps = detectedGaps.filter(
+        (g) =>
+          g.mid > lastSplitSample + minSpeechSamples &&
+          totalSamples - g.mid >= remainingSegmentsAfter * minSpeechSamples
+      );
+
+      if (candidateGaps.length > 0) {
+        candidateGaps.sort((g1, g2) => Math.abs(g1.mid - target) - Math.abs(g2.mid - target));
+        const chosenGap = candidateGaps[0];
+        splitIndices.push(chosenGap.mid);
+        lastSplitSample = chosenGap.mid;
+      } else {
+        splitIndices.push(target);
+        lastSplitSample = target;
+      }
     }
   }
 
