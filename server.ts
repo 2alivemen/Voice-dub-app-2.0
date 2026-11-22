@@ -399,10 +399,13 @@ async function startServer() {
         contents = [
           {
             role: 'user',
-            parts: turns.map((turn) => {
+            parts: turns.map((turn, tIdx) => {
               const combinedStyle = [
                 speakerConfig.basePersonality,
                 turn.emotion ? `Delivery: ${turn.emotion}` : undefined,
+                turns.length > 1 && tIdx > 0
+                  ? 'Take a distinct breath pause with complete acoustic silence before beginning this dialogue line'
+                  : undefined,
               ].filter(Boolean).join('. ');
 
               const spokenText = turn.vocalizeSpeakerName

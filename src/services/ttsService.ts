@@ -323,7 +323,7 @@ export async function synthesizeFullScene(
               if (!/[.!?।]$/.test(lineText)) {
                 lineText = `${lineText}.`;
               }
-              lineText = `${lineText}\n\n[pause: 800ms]\n\n`;
+              lineText = `${lineText}\n\n...\n\n`;
             }
             return {
               id: turn.id,
